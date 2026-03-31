@@ -766,15 +766,11 @@ function writeWeightChartSection_(sheet, rows, cutoffDate, startRow, startCol) {
 }
 
 function clearMergedRangesInArea_(sheet, startRow, startCol, numRows, numCols) {
-  try {
-    sheet.getRange(startRow, startCol, numRows, numCols).breakApart();
-  } catch (e) {
-    const lastRow = Math.max(sheet.getLastRow(), startRow + numRows - 1);
-    const lastCol = Math.max(sheet.getLastColumn(), startCol + numCols - 1);
-    const boundedRows = Math.max(1, lastRow - startRow + 1);
-    const boundedCols = Math.max(1, lastCol - startCol + 1);
-    sheet.getRange(startRow, startCol, boundedRows, boundedCols).breakApart();
-  }
+  const safeRows = Math.max(1, numRows);
+  const safeCols = Math.max(1, numCols);
+  const area = sheet.getRange(startRow, startCol, safeRows, safeCols);
+  const mergedRanges = area.getMergedRanges();
+  mergedRanges.forEach(range => range.breakApart());
 }
 
 function getWeightChartSectionHeight_() {
