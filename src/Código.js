@@ -4,8 +4,26 @@ const WORKOUTS_SHEET_NAME = 'workouts';
 const DEBUG_SHEET_NAME = 'debug';
 const DASHBOARD_SHEET_NAME = 'dashboard';
 const STATS_SHEET_NAME = 'stats';
+const READINESS_SHEET_NAME = 'readiness_50d';
 const TOKEN = '2004';
 const MAX_CELL_CHARS = 45000;
+const MAX_PAYLOAD_BYTES = 5 * 1024 * 1024;
+const DATE_FIELDS = new Set(['date', 'date_iso', 'received_at', 'sleepStart', 'sleepEnd', 'inBedStart', 'inBedEnd', 'start_iso', 'end_iso', 'start', 'end', 'startDate', 'endDate']);
+const DECIMAL2_FIELDS = new Set(['totalSleep', 'totalSleep_num', 'deep', 'deep_num', 'rem', 'rem_num', 'core', 'core_num', 'awake', 'awake_num', 'inBed', 'inBed_num', 'Min', 'Min_num', 'Max', 'Max_num', 'Avg', 'Avg_num', 'duration_min', 'distance_km', 'energy_kcal', 'avg_hr', 'max_hr', 'min_hr']);
+const READINESS_HEADERS = [
+  'Fecha (DD-MM-YYYY)',
+  'Sleep_hours',
+  'Sleep_quality',
+  'Readiness_score',
+  'HR_resting',
+  'HRV',
+  'Fatiga_percibida',
+  'Energia_autoinformada',
+  'Peso_kg',
+  'Fuente',
+  'Ultima_actualizacion (HH:MM DD-MM-YYYY)',
+  'Notas'
+];
 
 const DERIVED_SHEETS = {
   peso: ['weight_body_mass'],
@@ -22,6 +40,23 @@ const DERIVED_SHEETS = {
   ],
   sueno: ['sleep_analysis']
 };
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Health')
+    .addItem('Actualizar Dashboard', 'updateDashboardFromMenu_')
+    .addToUi();
+}
+
+function updateDashboardFromMenu_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  rebuildDerivedSheets_(ss);
+  rebuildWorkoutsSheet_(ss);
+  rebuildDashboard_(ss);
+  rebuildStatsSheet_(ss);
+  rebuildReadiness50dSheet_(ss);
+  ss.toast('Dashboard actualizado', 'Health', 5);
+}
 
 function doPost(e) {
   const lock = LockService.getScriptLock();
@@ -52,6 +87,10 @@ function doPost(e) {
 
     const contentType = String(e.postData.type || '').toLowerCase();
     const body = e.postData.contents;
+    if (String(body).length > MAX_PAYLOAD_BYTES) {
+      logDebug_('ERROR', { message: 'Payload demasiado grande', bytes: String(body).length });
+      return jsonResponse_({ ok: false, error: 'Payload demasiado grande' }, 413);
+    }
 
     let payload;
     if (contentType.includes('application/json') || looksLikeJson_(body)) {
@@ -124,13 +163,16 @@ function doPost(e) {
       inserted = values.length;
     }
 
-    if (isWorkouts) {
-      rebuildWorkoutsSheet_(ss);
-    } else {
-      rebuildDerivedSheets_(ss);
-      rebuildDashboard_(ss);
+    if (inserted > 0) {
+      if (isWorkouts) {
+        rebuildWorkoutsSheet_(ss);
+      } else {
+        rebuildDerivedSheets_(ss);
+        rebuildDashboard_(ss);
+      }
+      rebuildStatsSheet_(ss);
+      rebuildReadiness50dSheet_(ss);
     }
-    rebuildStatsSheet_(ss);
 
     logDebug_('SUCCESS', {
       inserted: inserted,
@@ -359,6 +401,11 @@ function enrichWorkoutRow_(row) {
 
   delete out.heartRateData;
   delete out.heartRateRecovery;
+  Object.keys(out).forEach(k => {
+    if (k.startsWith('heartRateData.') || k.startsWith('heartRateRecovery.')) {
+      delete out[k];
+    }
+  });
 
   out.dedupe_key = buildWorkoutDedupeKey_(out);
 
@@ -383,12 +430,18 @@ function normalizeWorkoutType_(value) {
 }
 
 function computeWorkoutDurationMinutes_(row) {
-  const direct = toNumberOrBlank_(row.duration_min || row.durationMinutes || row.duration || row.durationInMinutes);
-  if (direct !== '') return direct;
+  const direct = toNumberOrBlank_(row.duration_min || row.durationMinutes || row.duration || row.durationInMinutes || row.durationInSeconds);
+  if (direct !== '') {
+    const units = String(row.durationUnit || row.durationUnits || row.duration_unit || '').toLowerCase().trim();
+    if (units.indexOf('sec') !== -1 || units === 's') return direct / 60;
+    if (units.indexOf('hour') !== -1 || units === 'h' || units === 'hr' || units === 'hrs') return direct * 60;
+    if ((row.duration || row.durationInSeconds) && direct >= 1000) return direct / 60;
+    return direct;
+  }
 
   const start = toTimeMs_(row.start || row.startDate || row.start_iso || row.date);
   const end = toTimeMs_(row.end || row.endDate || row.end_iso);
-  if (start && end && end >= start) {
+  if (start !== null && end !== null && end >= start) {
     return (end - start) / 60000;
   }
   return '';
@@ -398,9 +451,10 @@ function normalizeDistanceKm_(value, units) {
   const n = toNumberOrBlank_(value);
   if (n === '') return '';
 
-  const u = String(units || '').toLowerCase();
+  const u = String(units || '').toLowerCase().trim();
   if (u.indexOf('km') !== -1) return n;
-  if (u.indexOf('m') !== -1) return n / 1000;
+  if (u === 'mi' || u.indexOf('mile') !== -1) return n * 1.60934;
+  if (u === 'm' || u === 'meter' || u === 'meters') return n / 1000;
 
   return n;
 }
@@ -451,6 +505,7 @@ function rebuildWorkoutsSheet_(ss) {
     'distance_km',
     'energy_kcal',
     'avg_hr',
+    'min_hr',
     'max_hr'
   ].filter(col => header.includes(col));
 
@@ -597,7 +652,7 @@ function buildLatestRowsSection_(rows, title, metricName, fields, limit) {
   const filtered = rows
     .filter(r => normalizeMetricName_(r.metric_name) === metricName)
     .filter(r => r.date_iso)
-    .sort((a, b) => toTimeMs_(b.date_iso) - toTimeMs_(a.date_iso))
+    .sort((a, b) => (toTimeMs_(b.date_iso) || -Infinity) - (toTimeMs_(a.date_iso) || -Infinity))
     .slice(0, limit);
 
   const width = fields.length;
@@ -668,7 +723,7 @@ function writeWeightChartSection_(sheet, rows, cutoffDate, startRow, startCol) {
       qty_num: toNumberOrBlank_(r.qty_num !== '' ? r.qty_num : r.qty)
     }))
     .filter(r => r.date_iso && r.qty_num !== '')
-    .sort((a, b) => toTimeMs_(a.date_iso) - toTimeMs_(b.date_iso));
+    .sort((a, b) => (toTimeMs_(a.date_iso) || Infinity) - (toTimeMs_(b.date_iso) || Infinity));
 
   const sectionHeight = getWeightChartSectionHeight_();
   const sectionWidth = 10;
@@ -727,20 +782,12 @@ function writeWeightChartSection_(sheet, rows, cutoffDate, startRow, startCol) {
   }
 }
 
-function getWeightChartSectionHeight_() {
-  return 18;
-}
-
 function clearMergedRangesInArea_(sheet, startRow, startCol, numRows, numCols) {
-  try {
-    const maxRows = Math.max(sheet.getMaxRows(), startRow + numRows);
-    const maxCols = Math.max(sheet.getMaxColumns(), startCol + numCols);
-    sheet.getRange(1, 1, maxRows, maxCols).breakApart();
-  } catch (e) {
-    const lastRow = Math.max(sheet.getLastRow(), startRow + numRows);
-    const lastCol = Math.max(sheet.getLastColumn(), startCol + numCols);
-    sheet.getRange(1, 1, lastRow, lastCol).breakApart();
-  }
+  const safeRows = Math.max(1, numRows);
+  const safeCols = Math.max(1, numCols);
+  const area = sheet.getRange(startRow, startCol, safeRows, safeCols);
+  const mergedRanges = area.getMergedRanges();
+  mergedRanges.forEach(range => range.breakApart());
 }
 
 function getWeightChartSectionHeight_() {
@@ -749,10 +796,10 @@ function getWeightChartSectionHeight_() {
 
 function buildWeightTrendSeries_(values) {
   const out = [];
-  for (var i = 0; i < values.length; i++) {
-    var start = Math.max(0, i - 2);
-    var slice = values.slice(start, i + 1);
-    var avg = slice.reduce((a, b) => a + b, 0) / slice.length;
+  for (let i = 0; i < values.length; i++) {
+    const start = Math.max(0, i - 2);
+    const slice = values.slice(start, i + 1);
+    const avg = slice.reduce((a, b) => a + b, 0) / slice.length;
     out.push(Number(avg.toFixed(2)));
   }
   return out;
@@ -761,11 +808,11 @@ function buildWeightTrendSeries_(values) {
 function formatFieldForDisplay_(field, value) {
   if (value === '' || value === null || value === undefined) return '';
 
-  if (field === 'date' || field === 'date_iso' || field === 'received_at' || field === 'sleepStart' || field === 'sleepEnd' || field === 'inBedStart' || field === 'inBedEnd' || field === 'start_iso' || field === 'end_iso' || field === 'start' || field === 'end' || field === 'startDate' || field === 'endDate') {
+  if (DATE_FIELDS.has(field)) {
     return formatDateForDisplay_(value);
   }
 
-  if (field === 'totalSleep' || field === 'totalSleep_num' || field === 'deep' || field === 'deep_num' || field === 'rem' || field === 'rem_num' || field === 'core' || field === 'core_num' || field === 'awake' || field === 'awake_num' || field === 'inBed' || field === 'inBed_num' || field === 'Min' || field === 'Min_num' || field === 'Max' || field === 'Max_num' || field === 'Avg' || field === 'Avg_num' || field === 'duration_min' || field === 'distance_km' || field === 'energy_kcal' || field === 'avg_hr' || field === 'max_hr') {
+  if (DECIMAL2_FIELDS.has(field)) {
     const n = toNumberOrBlank_(value);
     return n === '' ? '' : formatMetricValue_(n, 2);
   }
@@ -968,14 +1015,14 @@ function computeSleepScore_(rows, cutoff14d) {
   const deep = toNumberOrBlank_(latest.deep_num !== '' ? latest.deep_num : latest.deep);
   const rem = toNumberOrBlank_(latest.rem_num !== '' ? latest.rem_num : latest.rem);
 
-  var durationScore = 40;
+  let durationScore = 40;
   if (totalSleep >= 7.5 && totalSleep <= 8.5) durationScore = 100;
   else if (totalSleep >= 7) durationScore = 80;
   else if (totalSleep >= 6.5) durationScore = 60;
   else if (totalSleep >= 6) durationScore = 40;
   else durationScore = 20;
 
-  var continuityScore = 70;
+  let continuityScore = 70;
   if (awake !== '') {
     if (awake <= 0.2) continuityScore = 100;
     else if (awake <= 0.4) continuityScore = 80;
@@ -984,21 +1031,21 @@ function computeSleepScore_(rows, cutoff14d) {
     else continuityScore = 20;
   }
 
-  var architectureScore = 60;
+  let architectureScore = 60;
   if (totalSleep > 0 && deep !== '' && rem !== '') {
-    var restorativePct = (deep + rem) / totalSleep;
+    const restorativePct = (deep + rem) / totalSleep;
     if (restorativePct >= 0.35) architectureScore = 100;
     else if (restorativePct >= 0.30) architectureScore = 80;
     else if (restorativePct >= 0.25) architectureScore = 60;
     else architectureScore = 40;
   }
 
-  var regularityScore = 70;
+  let regularityScore = 70;
   const sleepRows = rows
     .filter(r => normalizeMetricName_(r.metric_name) === 'sleep_analysis')
     .filter(r => isOnOrAfter_(r.date_iso, cutoff14d))
     .filter(r => r.sleepStart)
-    .sort((a, b) => toTimeMs_(b.date_iso) - toTimeMs_(a.date_iso));
+    .sort((a, b) => (toTimeMs_(b.date_iso) || -Infinity) - (toTimeMs_(a.date_iso) || -Infinity));
 
   if (latest.sleepStart && sleepRows.length >= 4) {
     const minutes = sleepRows.map(r => minutesOfDay_(r.sleepStart)).filter(v => v !== '');
@@ -1025,7 +1072,7 @@ function computeRecoveryScore_(rows, cutoff14d) {
     .map(r => toNumberOrBlank_(r.qty_num !== '' ? r.qty_num : r.qty))
     .filter(v => v !== '');
 
-  var rhrScore = 70;
+  let rhrScore = 70;
   if (latestRhr !== '' && rhrValues.length >= 4) {
     const baseline = average_(rhrValues);
     const diff = latestRhr - baseline;
@@ -1043,7 +1090,7 @@ function computeRecoveryScore_(rows, cutoff14d) {
     .map(r => toNumberOrBlank_(r.qty_num !== '' ? r.qty_num : r.qty))
     .filter(v => v !== '');
 
-  var walkingScore = 70;
+  let walkingScore = 70;
   if (latestWalking !== '' && walkingValues.length >= 4) {
     const baselineW = average_(walkingValues);
     const diffPct = baselineW ? ((latestWalking - baselineW) / baselineW) * 100 : 0;
@@ -1164,7 +1211,6 @@ function rebuildStatsSheet_(ss) {
 
   try {
     stats.setFrozenRows(1);
-    stats.hideGridlines(true);
     stats.getRange(1, 1, 1, 4)
       .setFontWeight('bold')
       .setBackground('#d9ead3');
@@ -1184,9 +1230,173 @@ function rebuildStatsSheet_(ss) {
   } catch (e) {}
 }
 
+function rebuildReadiness50dSheet_(ss) {
+  const sheet = getOrCreateSheet_(ss, READINESS_SHEET_NAME);
+  const existingManual = getExistingReadinessManualMap_(sheet);
+  sheet.clearContents();
+
+  const rawRows = getRowsAsObjects_(ss.getSheetByName(SHEET_NAME));
+  const workoutRows = getRowsAsObjects_(ss.getSheetByName(WORKOUTS_RAW_SHEET_NAME));
+  const grouped = {};
+
+  rawRows.forEach(row => {
+    const metric = normalizeMetricName_(row.metric_name);
+    const dayKey = dayKeyFromDateValue_(row.date_iso || row.date || row.received_at);
+    if (!dayKey) return;
+    if (!grouped[dayKey]) grouped[dayKey] = {};
+    const day = grouped[dayKey];
+
+    if (metric === 'sleep_analysis') {
+      assignIfNotBlank_(day, 'sleep_hours', toNumberOrBlank_(row.totalSleep_num !== '' ? row.totalSleep_num : row.totalSleep));
+      assignIfNotBlank_(day, 'sleep_quality', toNumberOrBlank_(row.sleep_quality || row.sleepScore || row.qualityScore));
+    }
+    if (metric === 'resting_heart_rate') {
+      assignIfNotBlank_(day, 'hr_resting', toNumberOrBlank_(row.qty_num !== '' ? row.qty_num : row.qty));
+    }
+    if (metric === 'heart_rate_variability_sdnn') {
+      const hrv = toNumberOrBlank_(row.qty_num !== '' ? row.qty_num : row.qty);
+      if (hrv !== '') {
+        if (!day.hrv_values) day.hrv_values = [];
+        day.hrv_values.push(hrv);
+      }
+    }
+    if (metric === 'weight_body_mass') {
+      assignIfNotBlank_(day, 'peso_kg', toNumberOrBlank_(row.qty_num !== '' ? row.qty_num : row.qty));
+    }
+    assignIfNotBlank_(day, 'readiness_score', toNumberOrBlank_(row.readiness_score || row.readinessScore));
+    assignIfNotBlank_(day, 'fuente', String(row.source || '').trim());
+    assignIfNotBlank_(day, 'ultima_actualizacion', row.received_at || row.date_iso || row.date);
+  });
+
+  const today = new Date();
+  const cutoff14d = new Date(today.getTime() - 14 * 24 * 60 * 60 * 1000);
+  const todayKey = dayKeyFromDateValue_(today.toISOString());
+  const energyToday = computeEnergyReadiness_(rawRows, workoutRows, today, cutoff14d);
+  if (!grouped[todayKey]) grouped[todayKey] = {};
+  grouped[todayKey].sleep_quality = energyToday.sleepScore;
+  grouped[todayKey].readiness_score = energyToday.score;
+
+  Object.keys(grouped).forEach(key => {
+    const day = grouped[key];
+    if (day.hrv_values && day.hrv_values.length) {
+      day.hrv = average_(day.hrv_values);
+    }
+  });
+
+  const output = [READINESS_HEADERS];
+  for (let i = 0; i < 50; i++) {
+    const d = new Date(today.getFullYear(), today.getMonth(), today.getDate() - i);
+    const key = dayKeyFromDateValue_(d.toISOString());
+    const auto = grouped[key] || {};
+    const manual = existingManual[key] || {};
+
+    output.push([
+      formatDateDdMmYyyy_(d),
+      valueOrBlank_(auto.sleep_hours),
+      valueOrBlank_(auto.sleep_quality),
+      valueOrBlank_(auto.readiness_score),
+      valueOrBlank_(auto.hr_resting),
+      valueOrBlank_(auto.hrv),
+      valueOrBlank_(manual.fatiga_percibida),
+      valueOrBlank_(manual.energia_autoinformada),
+      valueOrBlank_(auto.peso_kg),
+      valueOrBlank_(auto.fuente),
+      formatDateForDisplay_(auto.ultima_actualizacion || new Date().toISOString()),
+      valueOrBlank_(manual.notas)
+    ]);
+  }
+
+  sheet.getRange(1, 1, output.length, READINESS_HEADERS.length).setValues(output);
+  formatReadinessSheet_(sheet, output.length - 1);
+}
+
+function getExistingReadinessManualMap_(sheet) {
+  const map = {};
+  if (!sheet || sheet.getLastRow() < 2) return map;
+  const data = sheet.getDataRange().getValues();
+  const header = data[0];
+  const idxFecha = header.indexOf('Fecha (DD-MM-YYYY)');
+  const idxFatiga = header.indexOf('Fatiga_percibida');
+  const idxEnergia = header.indexOf('Energia_autoinformada');
+  const idxNotas = header.indexOf('Notas');
+  if (idxFecha === -1) return map;
+
+  data.slice(1).forEach(r => {
+    const key = normalizeDateKeyFromDisplay_(r[idxFecha]);
+    if (!key) return;
+    map[key] = {
+      fatiga_percibida: idxFatiga === -1 ? '' : r[idxFatiga],
+      energia_autoinformada: idxEnergia === -1 ? '' : r[idxEnergia],
+      notas: idxNotas === -1 ? '' : r[idxNotas]
+    };
+  });
+  return map;
+}
+
+function formatReadinessSheet_(sheet, rowCount) {
+  try {
+    sheet.setFrozenRows(1);
+    sheet.getRange(1, 1, 1, READINESS_HEADERS.length)
+      .setFontWeight('bold')
+      .setBackground('#d9ead3')
+      .setHorizontalAlignment('center');
+    if (rowCount <= 0) return;
+
+    sheet.getRange(2, 1, rowCount, 1).setHorizontalAlignment('center');
+    sheet.getRange(2, 11, rowCount, 1).setHorizontalAlignment('center');
+
+    [2, 3, 4, 5, 6, 7, 8, 9].forEach(col => {
+      sheet.getRange(2, col, rowCount, 1).setNumberFormat('0.00');
+    });
+    [3, 4, 7, 8].forEach(col => {
+      sheet.getRange(2, col, rowCount, 1).setNumberFormat('0');
+    });
+
+    sheet.getRange(2, 1, rowCount, READINESS_HEADERS.length)
+      .setBorder(true, true, true, true, true, true);
+    autoResizeSomeColumns_(sheet, READINESS_HEADERS.length);
+  } catch (e) {}
+}
+
+function getRowsAsObjects_(sheet) {
+  if (!sheet || sheet.getLastRow() < 2) return [];
+  const data = sheet.getDataRange().getValues();
+  const header = data[0];
+  return data.slice(1).map(r => rowArrayToObject_(header, r));
+}
+
+function assignIfNotBlank_(obj, key, value) {
+  if (value === '' || value === null || value === undefined) return;
+  obj[key] = value;
+}
+
+function dayKeyFromDateValue_(value) {
+  const t = toTimeMs_(value);
+  if (t === null) return '';
+  const d = new Date(t);
+  return d.getFullYear() + '-' + pad2_(d.getMonth() + 1) + '-' + pad2_(d.getDate());
+}
+
+function normalizeDateKeyFromDisplay_(value) {
+  const s = String(value || '').trim();
+  const m = s.match(/^(\d{2})-(\d{2})-(\d{4})$/);
+  if (!m) return '';
+  return m[3] + '-' + m[2] + '-' + m[1];
+}
+
+function formatDateDdMmYyyy_(value) {
+  const d = new Date(value);
+  if (isNaN(d.getTime())) return '';
+  return pad2_(d.getDate()) + '-' + pad2_(d.getMonth() + 1) + '-' + d.getFullYear();
+}
+
+function valueOrBlank_(value) {
+  return value === null || value === undefined ? '' : value;
+}
+
 function rowArrayToObject_(header, row) {
   const obj = {};
-  for (var i = 0; i < header.length; i++) obj[header[i]] = row[i];
+  for (let i = 0; i < header.length; i++) obj[header[i]] = row[i];
   return obj;
 }
 
@@ -1246,7 +1456,7 @@ function getLatestRow_(rows, metricName) {
   const filtered = rows
     .filter(r => normalizeMetricName_(r.metric_name) === metricName)
     .filter(r => r.date_iso)
-    .sort((a, b) => toTimeMs_(b.date_iso) - toTimeMs_(a.date_iso));
+    .sort((a, b) => (toTimeMs_(b.date_iso) || -Infinity) - (toTimeMs_(a.date_iso) || -Infinity));
 
   return filtered.length ? filtered[0] : null;
 }
@@ -1275,7 +1485,7 @@ function getLatestReceivedAt_(rows) {
   const vals = rows
     .map(r => r.received_at)
     .filter(Boolean)
-    .sort((a, b) => toTimeMs_(b) - toTimeMs_(a));
+    .sort((a, b) => (toTimeMs_(b) || -Infinity) - (toTimeMs_(a) || -Infinity));
 
   return vals.length ? vals[0] : '';
 }
@@ -1288,13 +1498,13 @@ function average_(arr) {
 
 function isOnOrAfter_(dateValue, sinceDate) {
   const t = toTimeMs_(dateValue);
-  return t && t >= sinceDate.getTime();
+  return t !== null && t >= sinceDate.getTime();
 }
 
 function toTimeMs_(dateValue) {
-  if (!dateValue) return 0;
+  if (!dateValue) return null;
   const d = new Date(dateValue);
-  return isNaN(d.getTime()) ? 0 : d.getTime();
+  return isNaN(d.getTime()) ? null : d.getTime();
 }
 
 function formatMetricValue_(value, decimals) {
@@ -1381,7 +1591,9 @@ function normalizeDateString_(value) {
   const s = String(value).trim();
   if (!s) return '';
 
-  const normalized = s.replace(' ', 'T').replace(/ ([+-]\d{4})$/, '$1');
+  const normalized = s
+    .replace(/^(\d{4}-\d{2}-\d{2}) /, '$1T')
+    .replace(/ ([+-]\d{2}:?\d{2})$/, '$1');
   const d = new Date(normalized);
 
   if (!isNaN(d.getTime())) return d.toISOString();
@@ -1466,7 +1678,7 @@ function logDebug_(stage, data) {
 }
 
 function autoResizeSomeColumns_(sheet, count) {
-  for (var i = 1; i <= count; i++) {
+  for (let i = 1; i <= count; i++) {
     try {
       sheet.autoResizeColumn(i);
     } catch (e) {}
