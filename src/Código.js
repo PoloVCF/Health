@@ -26,6 +26,22 @@ const DERIVED_SHEETS = {
   sueno: ['sleep_analysis']
 };
 
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Health')
+    .addItem('Actualizar Dashboard', 'updateDashboardFromMenu_')
+    .addToUi();
+}
+
+function updateDashboardFromMenu_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  rebuildDerivedSheets_(ss);
+  rebuildWorkoutsSheet_(ss);
+  rebuildDashboard_(ss);
+  rebuildStatsSheet_(ss);
+  ss.toast('Dashboard actualizado', 'Health', 5);
+}
+
 function doPost(e) {
   const lock = LockService.getScriptLock();
   lock.waitLock(30000);
