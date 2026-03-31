@@ -1236,6 +1236,7 @@ function rebuildReadiness50dSheet_(ss) {
   sheet.clearContents();
 
   const rawRows = getRowsAsObjects_(ss.getSheetByName(SHEET_NAME));
+  const workoutRows = getRowsAsObjects_(ss.getSheetByName(WORKOUTS_RAW_SHEET_NAME));
   const grouped = {};
 
   rawRows.forEach(row => {
@@ -1253,7 +1254,11 @@ function rebuildReadiness50dSheet_(ss) {
       assignIfNotBlank_(day, 'hr_resting', toNumberOrBlank_(row.qty_num !== '' ? row.qty_num : row.qty));
     }
     if (metric === 'heart_rate_variability_sdnn') {
-      assignIfNotBlank_(day, 'hrv', toNumberOrBlank_(row.qty_num !== '' ? row.qty_num : row.qty));
+      const hrv = toNumberOrBlank_(row.qty_num !== '' ? row.qty_num : row.qty);
+      if (hrv !== '') {
+        if (!day.hrv_values) day.hrv_values = [];
+        day.hrv_values.push(hrv);
+      }
     }
     if (metric === 'weight_body_mass') {
       assignIfNotBlank_(day, 'peso_kg', toNumberOrBlank_(row.qty_num !== '' ? row.qty_num : row.qty));
@@ -1264,6 +1269,20 @@ function rebuildReadiness50dSheet_(ss) {
   });
 
   const today = new Date();
+  const cutoff14d = new Date(today.getTime() - 14 * 24 * 60 * 60 * 1000);
+  const todayKey = dayKeyFromDateValue_(today.toISOString());
+  const energyToday = computeEnergyReadiness_(rawRows, workoutRows, today, cutoff14d);
+  if (!grouped[todayKey]) grouped[todayKey] = {};
+  grouped[todayKey].sleep_quality = energyToday.sleepScore;
+  grouped[todayKey].readiness_score = energyToday.score;
+
+  Object.keys(grouped).forEach(key => {
+    const day = grouped[key];
+    if (day.hrv_values && day.hrv_values.length) {
+      day.hrv = average_(day.hrv_values);
+    }
+  });
+
   const output = [READINESS_HEADERS];
   for (let i = 0; i < 50; i++) {
     const d = new Date(today.getFullYear(), today.getMonth(), today.getDate() - i);
