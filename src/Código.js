@@ -5,6 +5,8 @@ const DEBUG_SHEET_NAME = 'debug';
 const DASHBOARD_SHEET_NAME = 'dashboard';
 const STATS_SHEET_NAME = 'stats';
 const READINESS_SHEET_NAME = 'readiness_50d';
+const DASHBOARD_REFRESH_FUNCTION = 'refreshDashboardAndReadiness_';
+const DASHBOARD_REFRESH_TRIGGER_HOURS = [0, 6, 12, 18];
 const TOKEN = '2004';
 const MAX_CELL_CHARS = 45000;
 const MAX_PAYLOAD_BYTES = 5 * 1024 * 1024;
@@ -45,8 +47,40 @@ function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('Health')
     .addItem('Actualizar Dashboard', 'updateDashboardFromMenu_')
+    .addItem('Configurar actualización 4x día', 'setupQuarterDailyRefreshTriggers_')
     .addToUi();
 }
+
+function refreshDashboardAndReadiness_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  rebuildDashboard_(ss);
+  rebuildReadiness50dSheet_(ss);
+  rebuildStatsSheet_(ss);
+}
+
+function setupQuarterDailyRefreshTriggers_() {
+  ensureQuarterDailyRefreshTriggers_();
+  SpreadsheetApp.getActiveSpreadsheet().toast('Actualización programada 4 veces al día', 'Health', 5);
+}
+
+function ensureQuarterDailyRefreshTriggers_() {
+  const triggers = ScriptApp.getProjectTriggers();
+  triggers.forEach(trigger => {
+    if (trigger.getHandlerFunction() === DASHBOARD_REFRESH_FUNCTION) {
+      ScriptApp.deleteTrigger(trigger);
+    }
+  });
+
+  DASHBOARD_REFRESH_TRIGGER_HOURS.forEach(hour => {
+    ScriptApp.newTrigger(DASHBOARD_REFRESH_FUNCTION)
+      .timeBased()
+      .everyDays(1)
+      .atHour(hour)
+      .nearMinute(5)
+      .create();
+  });
+}
+
 
 function updateDashboardFromMenu_() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -1254,7 +1288,7 @@ function rebuildReadiness50dSheet_(ss) {
       assignIfNotBlank_(day, 'hr_resting', toNumberOrBlank_(row.qty_num !== '' ? row.qty_num : row.qty));
     }
     if (metric === 'heart_rate_variability_sdnn') {
-      const hrv = toNumberOrBlank_(row.qty_num !== '' ? row.qty_num : row.qty);
+      const hrv = extractHrvValue_(row);
       if (hrv !== '') {
         if (!day.hrv_values) day.hrv_values = [];
         day.hrv_values.push(hrv);
@@ -1269,12 +1303,23 @@ function rebuildReadiness50dSheet_(ss) {
   });
 
   const today = new Date();
-  const cutoff14d = new Date(today.getTime() - 14 * 24 * 60 * 60 * 1000);
-  const todayKey = dayKeyFromDateValue_(today.toISOString());
-  const energyToday = computeEnergyReadiness_(rawRows, workoutRows, today, cutoff14d);
-  if (!grouped[todayKey]) grouped[todayKey] = {};
-  grouped[todayKey].sleep_quality = energyToday.sleepScore;
-  grouped[todayKey].readiness_score = energyToday.score;
+
+  for (let i = 0; i < 50; i++) {
+    const dayDate = new Date(today.getFullYear(), today.getMonth(), today.getDate() - i, 23, 59, 59, 999);
+    const dayKey = dayKeyFromDateValue_(dayDate.toISOString());
+    const cutoff14d = new Date(dayDate.getTime() - 14 * 24 * 60 * 60 * 1000);
+    const rawRowsToDay = filterRowsUpToDate_(rawRows, dayDate);
+    const workoutRowsToDay = filterRowsUpToDate_(workoutRows, dayDate);
+    const energyDay = computeEnergyReadiness_(rawRowsToDay, workoutRowsToDay, dayDate, cutoff14d);
+
+    if (!grouped[dayKey]) grouped[dayKey] = {};
+    if (grouped[dayKey].sleep_quality === '' || grouped[dayKey].sleep_quality === null || grouped[dayKey].sleep_quality === undefined) {
+      grouped[dayKey].sleep_quality = energyDay.sleepScore;
+    }
+    if (grouped[dayKey].readiness_score === '' || grouped[dayKey].readiness_score === null || grouped[dayKey].readiness_score === undefined) {
+      grouped[dayKey].readiness_score = energyDay.score;
+    }
+  }
 
   Object.keys(grouped).forEach(key => {
     const day = grouped[key];
@@ -1392,6 +1437,34 @@ function formatDateDdMmYyyy_(value) {
 
 function valueOrBlank_(value) {
   return value === null || value === undefined ? '' : value;
+}
+
+function filterRowsUpToDate_(rows, maxDate) {
+  if (!rows || !rows.length) return [];
+  const maxTime = maxDate.getTime();
+  return rows.filter(row => {
+    const t = toTimeMs_(row.date_iso || row.date || row.received_at || row.start_iso || row.start || row.startDate);
+    return t !== null && t <= maxTime;
+  });
+}
+
+function extractHrvValue_(row) {
+  const candidates = [
+    row.qty_num,
+    row.qty,
+    row.Avg_num,
+    row.Avg,
+    row.sdnn,
+    row.hrv,
+    row.value_num,
+    row.value
+  ];
+
+  for (let i = 0; i < candidates.length; i++) {
+    const parsed = toNumberOrBlank_(candidates[i]);
+    if (parsed !== '') return parsed;
+  }
+  return '';
 }
 
 function rowArrayToObject_(header, row) {
