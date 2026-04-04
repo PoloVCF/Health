@@ -422,6 +422,7 @@ function enrichWorkoutRow_(row) {
     out['energy.qty'] ||
     out.activeEnergyBurned ||
     out.totalEnergyBurned ||
+    out.totalEnergy ||
     out.activeEnergy ||
     out.totalEnergy ||
     out.energy ||
