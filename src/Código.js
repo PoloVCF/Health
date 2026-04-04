@@ -47,6 +47,7 @@ function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('Health')
     .addItem('Actualizar Dashboard', 'updateDashboardFromMenu_')
+    .addItem('Recalcular kcal workouts existentes', 'recalculateExistingWorkoutEnergyFromMenu_')
     .addItem('Configurar actualización 4x día', 'setupQuarterDailyRefreshTriggers_')
     .addToUi();
 }
@@ -84,12 +85,21 @@ function ensureQuarterDailyRefreshTriggers_() {
 
 function updateDashboardFromMenu_() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
+  recalculateExistingWorkoutEnergyKcal_(ss);
   rebuildDerivedSheets_(ss);
   rebuildWorkoutsSheet_(ss);
   rebuildDashboard_(ss);
   rebuildStatsSheet_(ss);
   rebuildReadiness50dSheet_(ss);
   ss.toast('Dashboard actualizado', 'Health', 5);
+}
+
+function recalculateExistingWorkoutEnergyFromMenu_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const updated = recalculateExistingWorkoutEnergyKcal_(ss);
+  rebuildWorkoutsSheet_(ss);
+  rebuildStatsSheet_(ss);
+  ss.toast('Workouts recalculados: ' + updated, 'Health', 5);
 }
 
 function doPost(e) {
@@ -154,6 +164,10 @@ function doPost(e) {
     const now = new Date();
     let rows = isWorkouts ? normalizeWorkoutPayloadToRows_(payload, now) : normalizePayloadToRows_(payload, now);
     rows = rows.map(isWorkouts ? enrichWorkoutRow_ : enrichRow_);
+    if (isWorkouts) {
+      const fallbackWeightKg = getLatestWeightKgFromRaw_(ss);
+      rows = rows.map(row => enrichWorkoutEnergyWithFallbackWeight_(row, fallbackWeightKg));
+    }
 
     logDebug_('ROWS', {
       rowsLength: rows.length,
@@ -403,11 +417,27 @@ function enrichWorkoutRow_(row) {
   out.energy_kcal = normalizeEnergyKcal_(
     out.energy ||
     out.totalEnergyBurned ||
+    out.totalEnergy ||
     out.activeEnergy ||
+    out.activeEnergyBurned ||
     out.kcal ||
+    out.calories ||
     out['activeEnergy.qty'] ||
-    out['energy.qty']
+    out['energy.qty'] ||
+    out['totalEnergyBurned.qty'] ||
+    out['totalEnergy.qty'] ||
+    out['activeEnergyBurned.qty'],
+    out.energy_units ||
+    out.energyUnit ||
+    out['energy.units'] ||
+    out['activeEnergy.units'] ||
+    out['totalEnergyBurned.units'] ||
+    out['totalEnergy.units'] ||
+    out['activeEnergyBurned.units']
   );
+  if (out.energy_kcal === '') {
+    out.energy_kcal = computeEnergyFromIntensity_(out);
+  }
 
   out.avg_hr = toNumberOrBlank_(
     out.avg_hr ||
@@ -493,8 +523,160 @@ function normalizeDistanceKm_(value, units) {
   return n;
 }
 
-function normalizeEnergyKcal_(value) {
-  return toNumberOrBlank_(value);
+function normalizeEnergyKcal_(value, units) {
+  if (value === null || value === undefined || value === '') return '';
+
+  if (typeof value === 'object') {
+    const qtyValue = value.qty !== undefined ? value.qty : (value.value !== undefined ? value.value : '');
+    const qtyUnits = value.units !== undefined ? value.units : (value.unit !== undefined ? value.unit : units);
+    return normalizeEnergyKcal_(qtyValue, qtyUnits);
+  }
+
+  let parsed = toNumberOrBlank_(value);
+  const raw = String(value || '').toLowerCase();
+
+  if (parsed === '') {
+    const match = raw.match(/-?\d+(?:[.,]\d+)?/);
+    if (match && match[0]) {
+      parsed = toNumberOrBlank_(match[0].replace(',', '.'));
+    }
+  }
+
+  if (parsed === '') return '';
+
+  const combinedUnits = String(units || '').toLowerCase().trim();
+  const hasKj = combinedUnits.indexOf('kj') !== -1 || raw.indexOf('kj') !== -1 || raw.indexOf('kilojoule') !== -1;
+  if (hasKj) return parsed / 4.184;
+
+  return parsed;
+}
+
+function computeEnergyFromIntensity_(row) {
+  const durationMin = toNumberOrBlank_(row.duration_min);
+  if (durationMin === '' || durationMin <= 0) return '';
+
+  const intensityQty = toNumberOrBlank_(
+    row['intensity.qty'] ||
+    row.intensity_qty ||
+    row.intensityQty ||
+    row.intensity
+  );
+  if (intensityQty === '' || intensityQty <= 0) return '';
+
+  const units = String(
+    row['intensity.units'] ||
+    row.intensity_units ||
+    row.intensityUnit ||
+    ''
+  ).toLowerCase().trim();
+  const compactUnits = units.replace(/\s+/g, '');
+  const weightKg = toNumberOrBlank_(
+    row.weight_kg ||
+    row.weightKg ||
+    row['bodyMass.qty'] ||
+    row.body_weight_kg
+  );
+
+  const looksPerMinute = units.indexOf('/min') !== -1 || units.indexOf('per min') !== -1 || units.indexOf('min-1') !== -1;
+  const looksPerHour = units.indexOf('/hr') !== -1 || units.indexOf('/hour') !== -1 || units.indexOf('per hour') !== -1 || units.indexOf('h-1') !== -1;
+  const looksPerKg = compactUnits.indexOf('/kg') !== -1 || compactUnits.indexOf('·kg') !== -1 || compactUnits.indexOf('*kg') !== -1 || compactUnits.indexOf('kg-1') !== -1;
+  const looksKcal = units.indexOf('kcal') !== -1 || units.indexOf('kilocal') !== -1 || units.indexOf('cal') === 0;
+
+  if (looksPerHour && looksPerKg && looksKcal) {
+    if (weightKg === '' || weightKg <= 0) return '';
+    return intensityQty * weightKg * (durationMin / 60);
+  }
+
+  if (looksPerMinute && looksKcal) {
+    return intensityQty * durationMin;
+  }
+
+  const looksKj = units.indexOf('kj') !== -1 || units.indexOf('kilojoule') !== -1;
+  if (looksPerHour && looksPerKg && looksKj) {
+    if (weightKg === '' || weightKg <= 0) return '';
+    return (intensityQty * weightKg * (durationMin / 60)) / 4.184;
+  }
+
+  if (looksPerMinute && looksKj) {
+    return (intensityQty * durationMin) / 4.184;
+  }
+
+  const looksMet = units.indexOf('met') !== -1;
+  if (looksMet) {
+    if (weightKg === '' || weightKg <= 0) return '';
+    return (intensityQty * 3.5 * weightKg / 200) * durationMin;
+  }
+
+  return '';
+}
+
+function enrichWorkoutEnergyWithFallbackWeight_(row, fallbackWeightKg) {
+  if (!row || row.energy_kcal !== '') return row;
+  if (fallbackWeightKg === '' || fallbackWeightKg === null || fallbackWeightKg === undefined) return row;
+
+  const out = Object.assign({}, row);
+  if (toNumberOrBlank_(out.weight_kg) === '') {
+    out.weight_kg = fallbackWeightKg;
+  }
+  out.energy_kcal = computeEnergyFromIntensity_(out);
+  return out;
+}
+
+function getLatestWeightKgFromRaw_(ss) {
+  const rawSheet = ss.getSheetByName(SHEET_NAME);
+  if (!rawSheet || rawSheet.getLastRow() < 2) return '';
+
+  const data = rawSheet.getDataRange().getValues();
+  const header = data[0];
+  const metricIdx = header.indexOf('metric_name');
+  const qtyIdx = header.indexOf('qty');
+  const qtyNumIdx = header.indexOf('qty_num');
+  if (metricIdx === -1 || (qtyIdx === -1 && qtyNumIdx === -1)) return '';
+
+  for (let i = data.length - 1; i >= 1; i--) {
+    const metricName = normalizeMetricName_(data[i][metricIdx]);
+    if (metricName !== 'weight_body_mass') continue;
+
+    const qtyValue = qtyNumIdx !== -1 ? data[i][qtyNumIdx] : data[i][qtyIdx];
+    const parsed = toNumberOrBlank_(qtyValue);
+    if (parsed !== '' && parsed > 0) return parsed;
+  }
+  return '';
+}
+
+function recalculateExistingWorkoutEnergyKcal_(ss) {
+  const sheet = ss.getSheetByName(WORKOUTS_RAW_SHEET_NAME);
+  if (!sheet || sheet.getLastRow() < 2) return 0;
+
+  const data = sheet.getDataRange().getValues();
+  const header = data[0];
+  const energyIdx = header.indexOf('energy_kcal');
+  if (energyIdx === -1) return 0;
+
+  const fallbackWeightKg = getLatestWeightKgFromRaw_(ss);
+  if (fallbackWeightKg === '') return 0;
+
+  let updated = 0;
+  const newEnergyCol = data.slice(1).map(row => {
+    const current = row[energyIdx];
+    if (toNumberOrBlank_(current) !== '') return [current];
+
+    const obj = rowArrayToObject_(header, row);
+    const enriched = enrichWorkoutRow_(obj);
+    const withWeight = enrichWorkoutEnergyWithFallbackWeight_(enriched, fallbackWeightKg);
+    const next = withWeight.energy_kcal;
+
+    if (toNumberOrBlank_(next) !== '') {
+      updated++;
+      return [next];
+    }
+    return [current];
+  });
+
+  if (updated > 0) {
+    sheet.getRange(2, energyIdx + 1, newEnergyCol.length, 1).setValues(newEnergyCol);
+  }
+  return updated;
 }
 
 function getExistingDedupeKeys_(sheet) {
