@@ -415,18 +415,19 @@ function enrichWorkoutRow_(row) {
   );
 
   out.energy_kcal = normalizeEnergyKcal_(
-    out.energy ||
+    out['activeEnergy.qty'] ||
+    out['activeEnergyBurned.qty'] ||
+    out['totalEnergyBurned.qty'] ||
+    out['totalEnergy.qty'] ||
+    out['energy.qty'] ||
+    out.activeEnergyBurned ||
     out.totalEnergyBurned ||
     out.totalEnergy ||
     out.activeEnergy ||
-    out.activeEnergyBurned ||
+    out.totalEnergy ||
+    out.energy ||
     out.kcal ||
-    out.calories ||
-    out['activeEnergy.qty'] ||
-    out['energy.qty'] ||
-    out['totalEnergyBurned.qty'] ||
-    out['totalEnergy.qty'] ||
-    out['activeEnergyBurned.qty'],
+    out.calories,
     out.energy_units ||
     out.energyUnit ||
     out['energy.units'] ||
@@ -494,19 +495,21 @@ function normalizeWorkoutType_(value) {
 }
 
 function computeWorkoutDurationMinutes_(row) {
+  const start = toTimeMs_(row.start || row.startDate || row.start_iso || row.date);
+  const end = toTimeMs_(row.end || row.endDate || row.end_iso);
+  if (start !== null && end !== null && end >= start) {
+    const byRange = (end - start) / 60000;
+    if (byRange > 0) return byRange;
+  }
+
   const direct = toNumberOrBlank_(row.duration_min || row.durationMinutes || row.duration || row.durationInMinutes || row.durationInSeconds);
   if (direct !== '') {
     const units = String(row.durationUnit || row.durationUnits || row.duration_unit || '').toLowerCase().trim();
+    if (units.indexOf('ms') !== -1 || units.indexOf('millisecond') !== -1) return direct / 60000;
     if (units.indexOf('sec') !== -1 || units === 's') return direct / 60;
     if (units.indexOf('hour') !== -1 || units === 'h' || units === 'hr' || units === 'hrs') return direct * 60;
     if ((row.duration || row.durationInSeconds) && direct >= 1000) return direct / 60;
     return direct;
-  }
-
-  const start = toTimeMs_(row.start || row.startDate || row.start_iso || row.date);
-  const end = toTimeMs_(row.end || row.endDate || row.end_iso);
-  if (start !== null && end !== null && end >= start) {
-    return (end - start) / 60000;
   }
   return '';
 }
@@ -570,7 +573,7 @@ function computeEnergyFromIntensity_(row) {
     ''
   ).toLowerCase().trim();
   const compactUnits = units.replace(/\s+/g, '');
-  const weightKg = toNumberOrBlank_(
+  const weightKg = normalizeWeightKg_(
     row.weight_kg ||
     row.weightKg ||
     row['bodyMass.qty'] ||
@@ -612,11 +615,12 @@ function computeEnergyFromIntensity_(row) {
 
 function enrichWorkoutEnergyWithFallbackWeight_(row, fallbackWeightKg) {
   if (!row || row.energy_kcal !== '') return row;
-  if (fallbackWeightKg === '' || fallbackWeightKg === null || fallbackWeightKg === undefined) return row;
+  const safeFallbackWeightKg = normalizeWeightKg_(fallbackWeightKg);
+  if (safeFallbackWeightKg === '') return row;
 
   const out = Object.assign({}, row);
-  if (toNumberOrBlank_(out.weight_kg) === '') {
-    out.weight_kg = fallbackWeightKg;
+  if (normalizeWeightKg_(out.weight_kg) === '') {
+    out.weight_kg = safeFallbackWeightKg;
   }
   out.energy_kcal = computeEnergyFromIntensity_(out);
   return out;
@@ -638,10 +642,17 @@ function getLatestWeightKgFromRaw_(ss) {
     if (metricName !== 'weight_body_mass') continue;
 
     const qtyValue = qtyNumIdx !== -1 ? data[i][qtyNumIdx] : data[i][qtyIdx];
-    const parsed = toNumberOrBlank_(qtyValue);
+    const parsed = normalizeWeightKg_(qtyValue);
     if (parsed !== '' && parsed > 0) return parsed;
   }
   return '';
+}
+
+function normalizeWeightKg_(value) {
+  const n = toNumberOrBlank_(value);
+  if (n === '') return '';
+  if (n < 20 || n > 300) return '';
+  return n;
 }
 
 function recalculateExistingWorkoutEnergyKcal_(ss) {
