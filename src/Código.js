@@ -670,9 +670,19 @@ function recalculateExistingWorkoutEnergyKcal_(ss) {
   let updated = 0;
   const newEnergyCol = data.slice(1).map(row => {
     const current = row[energyIdx];
+    const obj = rowArrayToObject_(header, row);
+    const trustedFromPayload = computeTrustedWorkoutEnergyKcalFromRow_(obj);
+    if (trustedFromPayload !== '') {
+      const currentNum = toNumberOrBlank_(current);
+      if (currentNum === '' || Math.abs(currentNum - trustedFromPayload) > 0.01) {
+        updated++;
+        return [trustedFromPayload];
+      }
+      return [current];
+    }
+
     if (toNumberOrBlank_(current) !== '') return [current];
 
-    const obj = rowArrayToObject_(header, row);
     const enriched = enrichWorkoutRow_(obj);
     const withWeight = enrichWorkoutEnergyWithFallbackWeight_(enriched, fallbackWeightKg);
     const next = withWeight.energy_kcal;
@@ -688,6 +698,30 @@ function recalculateExistingWorkoutEnergyKcal_(ss) {
     sheet.getRange(2, energyIdx + 1, newEnergyCol.length, 1).setValues(newEnergyCol);
   }
   return updated;
+}
+
+function computeTrustedWorkoutEnergyKcalFromRow_(row) {
+  return normalizeEnergyKcal_(
+    row['activeEnergy.qty'] ||
+    row['activeEnergyBurned.qty'] ||
+    row['totalEnergyBurned.qty'] ||
+    row['totalEnergy.qty'] ||
+    row['energy.qty'] ||
+    row.activeEnergyBurned ||
+    row.totalEnergyBurned ||
+    row.activeEnergy ||
+    row.totalEnergy ||
+    row.energy ||
+    row.kcal ||
+    row.calories,
+    row.energy_units ||
+    row.energyUnit ||
+    row['energy.units'] ||
+    row['activeEnergy.units'] ||
+    row['totalEnergyBurned.units'] ||
+    row['totalEnergy.units'] ||
+    row['activeEnergyBurned.units']
+  );
 }
 
 function getExistingDedupeKeys_(sheet) {
