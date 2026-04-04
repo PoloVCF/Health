@@ -47,6 +47,7 @@ function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('Health')
     .addItem('Actualizar Dashboard', 'updateDashboardFromMenu_')
+    .addItem('Recalcular kcal workouts existentes', 'recalculateExistingWorkoutEnergyFromMenu_')
     .addItem('Configurar actualización 4x día', 'setupQuarterDailyRefreshTriggers_')
     .addToUi();
 }
@@ -84,12 +85,21 @@ function ensureQuarterDailyRefreshTriggers_() {
 
 function updateDashboardFromMenu_() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
+  recalculateExistingWorkoutEnergyKcal_(ss);
   rebuildDerivedSheets_(ss);
   rebuildWorkoutsSheet_(ss);
   rebuildDashboard_(ss);
   rebuildStatsSheet_(ss);
   rebuildReadiness50dSheet_(ss);
   ss.toast('Dashboard actualizado', 'Health', 5);
+}
+
+function recalculateExistingWorkoutEnergyFromMenu_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const updated = recalculateExistingWorkoutEnergyKcal_(ss);
+  rebuildWorkoutsSheet_(ss);
+  rebuildStatsSheet_(ss);
+  ss.toast('Workouts recalculados: ' + updated, 'Health', 5);
 }
 
 function doPost(e) {
@@ -632,6 +642,41 @@ function getLatestWeightKgFromRaw_(ss) {
     if (parsed !== '' && parsed > 0) return parsed;
   }
   return '';
+}
+
+function recalculateExistingWorkoutEnergyKcal_(ss) {
+  const sheet = ss.getSheetByName(WORKOUTS_RAW_SHEET_NAME);
+  if (!sheet || sheet.getLastRow() < 2) return 0;
+
+  const data = sheet.getDataRange().getValues();
+  const header = data[0];
+  const energyIdx = header.indexOf('energy_kcal');
+  if (energyIdx === -1) return 0;
+
+  const fallbackWeightKg = getLatestWeightKgFromRaw_(ss);
+  if (fallbackWeightKg === '') return 0;
+
+  let updated = 0;
+  const newEnergyCol = data.slice(1).map(row => {
+    const current = row[energyIdx];
+    if (toNumberOrBlank_(current) !== '') return [current];
+
+    const obj = rowArrayToObject_(header, row);
+    const enriched = enrichWorkoutRow_(obj);
+    const withWeight = enrichWorkoutEnergyWithFallbackWeight_(enriched, fallbackWeightKg);
+    const next = withWeight.energy_kcal;
+
+    if (toNumberOrBlank_(next) !== '') {
+      updated++;
+      return [next];
+    }
+    return [current];
+  });
+
+  if (updated > 0) {
+    sheet.getRange(2, energyIdx + 1, newEnergyCol.length, 1).setValues(newEnergyCol);
+  }
+  return updated;
 }
 
 function getExistingDedupeKeys_(sheet) {
